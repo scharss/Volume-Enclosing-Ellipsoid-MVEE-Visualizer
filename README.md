@@ -1,5 +1,7 @@
 # Interactive 3D Minimum Volume Enclosing Ellipsoid (MVEE) Visualizer 🌌
 
+![MVEE Visualizer](https://raw.githubusercontent.com/scharss/Volume-Enclosing-Ellipsoid-MVEE-Visualizer/refs/heads/main/3dcil.png)
+
 This web application provides an interactive, real-time visualization of the Minimum Volume Enclosing Ellipsoid (MVEE) algorithm in a 3D space. It is built entirely with web technologies: [Three.js](https://threejs.org/) for 3D rendering and [numeric.js](http://numericjs.com/) for the underlying linear algebra computations.
 
 The MVEE is a fundamental concept in computational geometry and data analysis. It is the smallest possible ellipsoid that contains a given set of points. This tool allows users to intuitively understand how the shape, orientation, and size of the MVEE adapt to the spatial distribution of a point cloud.
