@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Visualizador Interactivo de Elipsoide de Mínimo Volumen (MVEE)</title>
+    <style>
+        body { margin: 0; font-family: sans-serif; background-color: #f0f0f0; overflow: hidden; }
+        canvas { display: block; }
+        #container { position: relative; width: 100vw; height: 100vh; cursor: grab; }
+        #container.paint-mode { cursor: crosshair; }
+        #ui-panel { position: absolute; top: 15px; left: 15px; background: rgba(255, 255, 255, 0.9); padding: 15px; border: 1px solid #ccc; border-radius: 8px; z-index: 10; transition: opacity 0.3s; }
+        #ui-panel.disabled { opacity: 0.6; pointer-events: none; }
+        #ui-panel h3 { margin-top: 0; }
+        #ui-panel label { display: block; margin: 5px 0; cursor: pointer; }
+        .button-group { display: flex; flex-direction: column; gap: 5px; margin-top: 10px; }
+        .button-group button { width: 100%; padding: 8px; border: 1px solid #aaa; border-radius: 5px; background-color: #fff; cursor: pointer; }
+        .button-group button.active { background-color: #a8d8ff; border-color: #007bff; }
+        #status { font-size: 12px; color: #666; margin-top: 15px; min-height: 1.2em; }
+        .label { position: absolute; color: #333; padding: 5px; font-size: 14px; pointer-events: none; background: rgba(255,255,255,0.7); border-radius:3px; }
+        #x-label { bottom: 20px; left: 50%; transform: translateX(-50%); }
+        #y-label { top: 50%; left: 20px; transform: translateY(-50%) rotate(-90deg); }
+        #z-label { top: 20px; right: 20px; }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/numeric/1.2.6/numeric.min.js"></script>
+</head>
+<body>
+    <div id="container">
+        <div id="ui-panel">
+            <h3>Controles</h3>
+            <fieldset>
+                <legend>Grupo Activo:</legend>
+                <label><input type="radio" name="group" value="groupA" checked> Group A (Rojo)</label>
+                <label><input type="radio" name="group" value="groupB"> Group B (Morado)</label>
+                <label><input type="radio" name="group" value="groupC"> Group C (Azul)</label>
+            </fieldset>
+            <div class="button-group">
+                <button id="paintToggleButton">Activar Pincel</button>
+                <button id="loadExampleButton">Cargar Ejemplo</button>
+                <button id="resetButton">Reiniciar</button>
+            </div>
+            <div id="status">Usa el ratón para explorar. Activa el pincel para añadir puntos.</div>
+        </div>
+        <div id="x-label" class="label">Dimensión X</div>
+        <div id="y-label" class="label">Dimensión Y</div>
+        <div id="z-label" class="label">Dimensión Z</div>
+    </div>
+
+    <script>
+        // --- ALGORITMO MVEE (Robusto) ---
+        function MVEE(points, tolerance = 0.005) {
+            const P = numeric.transpose(points);
+            const [d, N] = numeric.dim(P);
+            if (N <= d) return null;
+            let u = new Array(N).fill(1 / N);
+            
+            const getEllipsoidFromWeights = (cU) => {
+                const center = numeric.dot(P, cU);
+                const M_centered = numeric.sub(numeric.dot(numeric.dot(P, numeric.diag(cU)), numeric.transpose(P)), numeric.dot(numeric.transpose([center]), [center]));
+                if (Math.abs(numeric.det(M_centered)) < 1e-9) { return null; }
+                const A = numeric.inv(M_centered);
+                return { A: numeric.div(A, d), center };
+            };
+
+            for (let iter = 0; iter < 5000; iter++) {
+                const ellipsoid = getEllipsoidFromWeights(u);
+                if (!ellipsoid) return null;
+                const { A, center } = ellipsoid;
+                
+                let maxError = 0; let j = -1;
+                for (let i = 0; i < N; i++) {
+                    const point = P.map(col => col[i]);
+                    const diff = numeric.sub(point, center);
+                    const error = numeric.dot(numeric.dot(numeric.transpose(diff), A), diff);
+                    if (error > maxError) { maxError = error; j = i; }
+                }
+                if (maxError <= d * (1 + tolerance)) return { center, A };
+                const stepSize = (maxError / d - 1) / (d - 1);
+                u = numeric.add(numeric.mul(1 - stepSize, u), numeric.mul(stepSize, numeric.e(N, j)));
+            }
+            return getEllipsoidFromWeights(u);
+        }
+
+        // --- VARIABLES GLOBALES Y CÓDIGO DE LA APLICACIÓN ---
+        let scene, camera, renderer, controls, raycaster;
+        const container = document.getElementById('container');
+        const uiPanel = document.getElementById('ui-panel');
+        const statusText = document.getElementById('status');
+        const paintToggleButton = document.getElementById('paintToggleButton');
+        const mouse = new THREE.Vector2();
+        const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+        let dataStore = {
+            groupA:  { points: [], ellipsoid: null, color: 0xff0000, material: new THREE.MeshLambertMaterial({ color: 0xff0000, transparent: true, opacity: 0.5 }) },
+            groupB: { points: [], ellipsoid: null, color: 0x9400D3, material: new THREE.MeshLambertMaterial({ color: 0x9400D3, transparent: true, opacity: 0.6 }) },
+            groupC: { points: [], ellipsoid: null, color: 0x0000ff, material: new THREE.MeshLambertMaterial({ color: 0x0000ff, transparent: true, opacity: 0.5 }) }
+        };
+        let allMeshes = [];
+        let currentBoxHelper, currentGridHelper;
+        let isDragging = false;
+        let isPaintModeActive = false;
+
+        function init() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0xffffff);
+            camera = new THREE.PerspectiveCamera(50, container.clientWidth / container.clientHeight, 0.1, 1000);
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(container.clientWidth, container.clientHeight);
+            container.appendChild(renderer.domElement);
+            controls = new THREE.OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            raycaster = new THREE.Raycaster();
+            scene.add(new THREE.AmbientLight(0xeeeeee));
+            const light = new THREE.DirectionalLight(0xffffff, 0.7); light.position.set(1, 1, 1);
+            scene.add(light);
+
+            document.getElementById('resetButton').addEventListener('click', resetScene);
+            document.getElementById('loadExampleButton').addEventListener('click', startWithExampleData);
+            paintToggleButton.addEventListener('click', togglePaintMode);
+            container.addEventListener('pointerdown', onPointerDown);
+            container.addEventListener('pointermove', onPointerMove);
+            container.addEventListener('pointerup', onPointerUp);
+            window.addEventListener('resize', onWindowResize);
+
+            updateSceneBounds();
+            frameScene();
+            animate();
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        function togglePaintMode() {
+            isPaintModeActive = !isPaintModeActive;
+            paintToggleButton.classList.toggle('active', isPaintModeActive);
+            container.classList.toggle('paint-mode', isPaintModeActive);
+            
+            if (isPaintModeActive) {
+                paintToggleButton.textContent = 'Desactivar Pincel';
+                statusText.innerText = 'Haz clic y arrastra para pintar la nube de puntos.';
+                controls.enabled = false;
+            } else {
+                paintToggleButton.textContent = 'Activar Pincel';
+                statusText.innerText = 'Usa el ratón para explorar. Activa el pincel para añadir puntos.';
+                controls.enabled = true;
+            }
+        }
+        
+        function onPointerDown(event) {
+            if (isPaintModeActive) { isDragging = true; }
+        }
+
+        function onPointerMove(event) {
+            if (isPaintModeActive && isDragging) {
+                mouse.x = (event.clientX / container.clientWidth) * 2 - 1;
+                mouse.y = -(event.clientY / container.clientHeight) * 2 + 1;
+                raycaster.setFromCamera(mouse, camera);
+                const intersectionPoint = new THREE.Vector3();
+                if (raycaster.ray.intersectPlane(plane, intersectionPoint)) {
+                    const activeGroup = document.querySelector('input[name="group"]:checked').value;
+                    const SPREAD = 1.5;
+                    for (let i = 0; i < 5; i++) {
+                        const jitteredPoint = new THREE.Vector3(
+                            intersectionPoint.x + (Math.random() - 0.5) * SPREAD,
+                            intersectionPoint.y + (Math.random() - 0.5) * SPREAD,
+                            intersectionPoint.z + (Math.random() - 0.5) * SPREAD
+                        );
+                        addPoint(jitteredPoint, activeGroup, false);
+                    }
+                }
+            }
+        }
+        
+        function onPointerUp(event) {
+            if (isPaintModeActive && isDragging) {
+                isDragging = false;
+                for (const groupName in dataStore) {
+                    if (dataStore[groupName].points.length > (dataStore[groupName].ellipsoid ? 0 : 3)) {
+                        updateEllipsoid(groupName, false);
+                    }
+                }
+                updateSceneBounds();
+                frameScene();
+            }
+        }
+        
+        function addPoint(position, groupName, shouldUpdate = true) {
+            const group = dataStore[groupName];
+            group.points.push([position.x, position.y, position.z]);
+            const pointGeometry = new THREE.SphereGeometry(0.08, 12, 12);
+            const pointMaterial = new THREE.MeshLambertMaterial({ color: group.color });
+            const pointMesh = new THREE.Mesh(pointGeometry, pointMaterial);
+            pointMesh.position.copy(position);
+            scene.add(pointMesh);
+            allMeshes.push(pointMesh);
+            if (shouldUpdate) {
+                updateEllipsoid(groupName);
+            }
+        }
+
+        function resetScene() {
+            allMeshes.forEach(mesh => scene.remove(mesh));
+            allMeshes = [];
+            for (const groupName in dataStore) {
+                const group = dataStore[groupName];
+                group.points = [];
+                group.ellipsoid = null;
+            }
+            statusText.innerText = "Usa el ratón para explorar. Activa el pincel para añadir puntos.";
+            updateSceneBounds();
+            frameScene();
+        }
+
+        function startWithExampleData() {
+            resetScene();
+            dataStore.groupA.points = generate3DPointCloud(50, [-1, 1, 0], [2, 1.5, 1], [0, 0, -30]);
+            dataStore.groupB.points = generate3DPointCloud(50, [0.5, -1, 0.5], [1, 1, 1.5], [0, 0, 0]);
+            dataStore.groupC.points = generate3DPointCloud(50, [0,0,0], [1.5, 1.5, 1.5], [0,0,0]);
+            for (const groupName in dataStore) {
+                const group = dataStore[groupName];
+                group.points.forEach(p_coords => {
+                    const pointGeometry = new THREE.SphereGeometry(0.08, 12, 12);
+                    const pointMaterial = new THREE.MeshLambertMaterial({ color: group.color });
+                    const pointMesh = new THREE.Mesh(pointGeometry, pointMaterial);
+                    pointMesh.position.set(...p_coords);
+                    scene.add(pointMesh);
+                    allMeshes.push(pointMesh);
+                });
+                updateEllipsoid(groupName, false);
+            }
+            updateSceneBounds();
+            frameScene();
+        }
+
+        function updateEllipsoid(groupName, shouldFrame = true) {
+            const group = dataStore[groupName];
+            if (group.points.length < 4) { return; }
+            uiPanel.classList.add('disabled');
+            statusText.innerText = "Calculando MVEE...";
+            setTimeout(() => {
+                if (group.ellipsoid) {
+                    const index = allMeshes.indexOf(group.ellipsoid);
+                    if (index > -1) allMeshes.splice(index, 1);
+                    scene.remove(group.ellipsoid);
+                }
+                try {
+                    const mveeResult = MVEE(group.points);
+                    if (!mveeResult) throw new Error("Cálculo de MVEE falló.");
+                    group.ellipsoid = createEllipsoidFromMVEE(mveeResult.center, mveeResult.A, group.material);
+                    scene.add(group.ellipsoid);
+                    allMeshes.push(group.ellipsoid);
+                    statusText.innerText = "Pincel activo. Arrastra para seguir pintando o desactívalo.";
+                    if(shouldFrame) {
+                        updateSceneBounds();
+                        frameScene();
+                    }
+                } catch (error) {
+                    statusText.innerText = `Error: No se pudo calcular el MVEE.`;
+                    group.ellipsoid = null;
+                } finally {
+                    uiPanel.classList.remove('disabled');
+                }
+            }, 10);
+        }
+
+        function updateSceneBounds() {
+            if (currentBoxHelper) scene.remove(currentBoxHelper);
+            if (currentGridHelper) scene.remove(currentGridHelper);
+            const box = new THREE.Box3();
+            let objectFound = false;
+            allMeshes.forEach(mesh => { if (mesh) { box.expandByObject(mesh); objectFound = true; } });
+            if (!objectFound) {
+                box.setFromCenterAndSize(new THREE.Vector3(0, 0, 0), new THREE.Vector3(10, 8, 8));
+            } else {
+                const size = new THREE.Vector3(); box.getSize(size);
+                if (size.y < 4) { const center = new THREE.Vector3(); box.getCenter(center); box.setFromCenterAndSize(center, new THREE.Vector3(size.x, 4, size.z)); }
+                box.expandByScalar(1.2);
+            }
+            const size = new THREE.Vector3(); box.getSize(size);
+            const gridSize = Math.max(size.x, size.z);
+            currentBoxHelper = new THREE.Box3Helper(box, 0x000000);
+            currentGridHelper = new THREE.GridHelper(gridSize, gridSize / 2, 0xcccccc, 0xcccccc);
+            const center = new THREE.Vector3(); box.getCenter(center);
+            currentGridHelper.position.y = box.min.y;
+            scene.add(currentBoxHelper);
+            scene.add(currentGridHelper);
+        }
+
+        function frameScene() {
+            const box = new THREE.Box3();
+            if (currentBoxHelper) { box.copy(currentBoxHelper.box); }
+            else { box.setFromCenterAndSize(new THREE.Vector3(0, 0, 0), new THREE.Vector3(10, 8, 8)); }
+            const center = new THREE.Vector3(); const size = new THREE.Vector3();
+            box.getCenter(center); box.getSize(size);
+            const maxDim = Math.max(size.x, size.y, size.z);
+            const fov = camera.fov * (Math.PI / 180);
+            const cameraDistance = Math.abs(maxDim / Math.tan(fov / 2));
+            const newPos = new THREE.Vector3(center.x, center.y + size.y * 0.5, center.z + cameraDistance * 0.7);
+            if (controls.target.distanceTo(center) > 1 || Math.abs(camera.position.distanceTo(newPos)) > 5) {
+                camera.position.copy(newPos);
+                controls.target.copy(center);
+            }
+        }
+        
+        function onWindowResize(){
+            camera.aspect = container.clientWidth / container.clientHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(container.clientWidth, container.clientHeight);
+        }
+
+        function createEllipsoidFromMVEE(center, A, material) {
+            const geometry = new THREE.SphereGeometry(1, 32, 32);
+            const mesh = new THREE.Mesh(geometry, material);
+            const A_symmetric = numeric.mul(0.5, numeric.add(A, numeric.transpose(A)));
+            const eig = numeric.eig(A_symmetric);
+            if (!eig || !eig.lambda || !eig.E) throw new Error("Eigendecomposition failed.");
+            const eigenvalues = eig.lambda.x;
+            const eigenvectors = eig.E.x;
+            const MIN_VISUAL_RADIUS = 0.05;
+            const radii = eigenvalues.map(val => 
+                Math.max(MIN_VISUAL_RADIUS, 1 / Math.sqrt(Math.max(0.0001, val)))
+            );
+            const basis = new THREE.Matrix4().set(
+                eigenvectors[0][0], eigenvectors[1][0], eigenvectors[2][0], 0,
+                eigenvectors[0][1], eigenvectors[1][1], eigenvectors[2][1], 0,
+                eigenvectors[0][2], eigenvectors[1][2], eigenvectors[2][2], 0,
+                0, 0, 0, 1
+            );
+            const quaternion = new THREE.Quaternion().setFromRotationMatrix(basis);
+            mesh.position.set(...center);
+            mesh.setRotationFromQuaternion(quaternion);
+            mesh.scale.set(...radii);
+            return mesh;
+        }
+
+        function generate3DPointCloud(n, center, stdDevs, rotationDeg){
+            const points=[];
+            const rotationMatrix=new THREE.Matrix4().makeRotationFromEuler(new THREE.Euler(
+                rotationDeg[0]*Math.PI/180,
+                rotationDeg[1]*Math.PI/180,
+                rotationDeg[2]*Math.PI/180
+            ));
+            for(let i=0; i<n; i++){
+                const x=randomGaussian(0,stdDevs[0]);
+                const y=randomGaussian(0,stdDevs[1]);
+                const z=randomGaussian(0,stdDevs[2]);
+                const point=new THREE.Vector3(x,y,z).applyMatrix4(rotationMatrix);
+                points.push([point.x+center[0],point.y+center[1],point.z+center[2]]);
+            }
+            return points;
+        }
+
+        let spareRandom=null;
+        function randomGaussian(mean,stdDev){
+            let val;
+            if(spareRandom!==null){
+                val=spareRandom;
+                spareRandom=null;
+            } else {
+                let u,v,s;
+                do{
+                    u=Math.random()*2-1;
+                    v=Math.random()*2-1;
+                    s=u*u+v*v;
+                } while(s>=1||s===0);
+                let mul=Math.sqrt(-2.0*Math.log(s)/s);
+                val=u*mul;
+                spareRandom=v*mul;
+            }
+            return val*stdDev+mean;
+        }
+        
+        init();
+    </script>
+</body>
+</html>
